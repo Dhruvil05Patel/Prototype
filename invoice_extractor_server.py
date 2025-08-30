@@ -146,6 +146,18 @@ def extract_fields_from_image(image_path: str) -> Tuple[Dict[str, str], str]:
     except Exception as e:
         return {}, f"Error processing image: {str(e)}"
 
+def extract_invoice_data(image_path: str) -> Optional[Dict]:
+    """Main function to extract invoice data - wrapper for extract_fields_from_image."""
+    try:
+        data, error = extract_fields_from_image(image_path)
+        if error:
+            print(f"Error extracting data: {error}")
+            return None
+        return data
+    except Exception as e:
+        print(f"Error in extract_invoice_data: {e}")
+        return None
+
 def save_to_csv(data: Dict[str, str], csv_file: str) -> bool:
     """Save extracted data to CSV file."""
     try:
