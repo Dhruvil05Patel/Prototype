@@ -3,13 +3,15 @@ import json
 import uuid
 import csv
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, send_file
+from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, send_file, send_from_directory
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import requests
-from invoice_extractor import extract_invoice_data
+from invoice_extractor_server import extract_invoice_data
 
-app = Flask(__name__)
-app.secret_key = 'your-secret-key-here'  # Change this to a random secret key
+app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
+CORS(app)
+app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
 
 # Configuration
 UPLOAD_FOLDER = 'uploads'
@@ -219,7 +221,11 @@ def send_webhook(invoice_data, webhook_url):
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    return send_from_directory(app.static_folder, path)
 
 @app.route('/upload', methods=['GET', 'POST'])
 def upload_file():
@@ -322,6 +328,24 @@ def upload_file():
                     os.remove(filepath)
     
     return render_template('upload.html')
+
+@app.route('/api/download-json', methods=['POST'])
+def api_download_json():
+    """API endpoint for downloading JSON data"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Create a temporary file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(data, f, indent=2)
+            temp_path = f.name
+        
+        return send_file(temp_path, as_attachment=True, download_name='extracted_invoice_data.json')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/extract', methods=['POST'])
 def api_extract():
