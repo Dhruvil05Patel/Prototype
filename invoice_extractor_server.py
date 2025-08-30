@@ -1,5 +1,4 @@
 import os
-import csv
 import google.generativeai as genai
 from typing import Dict, Optional, Tuple
 from PIL import Image
@@ -34,99 +33,68 @@ def extract_fields_from_image(image_path: str) -> Tuple[Dict[str, str], str]:
             img_data = img_file.read()
         
         # Prepare the prompt
-        prompt = """Extract all data from this GST invoice and return it in a structured JSON format. 
+        prompt = """Extract data from this pharmacy invoice and return it in a structured JSON format.
         
-        For invoices with multiple items, create an array of items with all their details.
+        CRITICAL INSTRUCTIONS:
+        1. For each item, you MUST extract the NDC (National Drug Code) or SKU:
+           - Look for numbers in these formats: 12345-678-90, 1234567890, 12345678901, 1234-5678-90
+           - Look in a separate column specifically for SKU/NDC/HSN code
+           - If SKU/NDC is not found, use "NA" (do not generate or make up codes)
+           - Never extract SKU from product description or other fields
         
-        Return the response in this exact JSON structure:
+        2. Return the response in this exact JSON structure:
         {
           "company_info": {
-            "company_name": "string",
-            "company_address": "string", 
-            "city": "string",
-            "pincode": "string",
-            "gstin": "string",
-            "email": "string",
-            "phone": "string",
-            "website_url": "string",
-            "pan_number": "string",
-            "state_and_state_code": "string",
-            "contact_person_name": "string"
+            "company_name": "string"
+          },
+          "billing_info": {
+            "billing_company_name": "string",
+            "billing_address": "string"
+          },
+          "shipping_info": {
+            "shipping_company_name": "string",
+            "shipping_address": "string"
           },
           "invoice_info": {
             "gst_invoice_number": "string",
             "invoice_date": "string",
-            "invoice_type": "string",
-            "challan_number": "string",
-            "challan_date": "string",
-            "purchase_order_number": "string",
-            "purchase_order_date": "string",
-            "place_of_supply": "string",
-            "place_of_delivery": "string",
-            "reverse_charge_applicable": "string",
-            "e_invoice_irn": "string",
-            "e_way_bill_number": "string",
-            "qr_code": "string"
-          },
-          "billing_info": {
-            "billing_company_name": "string",
-            "billing_address": "string",
-            "billing_city": "string", 
-            "billing_pincode": "string",
-            "billing_party_gstin": "string",
-            "email_and_phone_of_buyer": "string"
-          },
-          "shipping_info": {
-            "shipping_company_name": "string",
-            "shipping_address": "string",
-            "shipping_city": "string",
-            "shipping_pincode": "string", 
-            "shipping_party_gstin": "string"
+            "due_date": "string",
+            "sales_person": "string",
+            "order_number": "string"
           },
           "items": [
             {
-              "description_of_goods": "string",
-              "hsn_code": "string",
-              "quantity": "number",
-              "uqc": "string",
-              "weight": "string",
-              "rate": "number",
-              "amount": "number",
-              "discount_per_item": "number",
-              "taxable_value": "number",
-              "batch_no": "string",
-              "expiry_date": "string",
-              "manufacturing_date": "string"
+              "sku_ndc_number": "string (or 'NA' if not found)",
+              "description_of_goods": "string (product name/description)",
+              "size": "string (or 'NA' if not found)",
+              "quantity": "number (0 if not found)",
+              "rate": "number (0 if not found)",
+              "amount": "number (0 if not found)",
+              "uqc": "string (e.g., 'CT', 'BOX', 'BTL')"
             }
           ],
-          "tax_info": {
-            "cgst": "number",
-            "sgst": "number", 
-            "igst": "number",
-            "cess_amount": "number"
-          },
           "totals": {
-            "invoice_amount": "number",
-            "total_invoice": "number"
-          },
-          "transport_info": {
-            "transporter_details": "string",
-            "vehicle_number": "string",
-            "lr_number": "string",
-            "transporter_id": "string"
-          },
-          "bank_info": {
-            "bank_details": "string"
+            "subtotal": "number (0 if not found, sum of all item amounts if not explicitly provided)",
+            "shipping": "number (0 if not found)",
+            "discount": "number (0 if not found)",
+            "tax": "number (0 if not found)",
+            "total_invoice": "number (0 if not found)"
           }
         }
         
-        IMPORTANT INSTRUCTIONS:
-        1. If any field is not present or not applicable, set it to null
-        2. For items array, include ALL items found on the invoice with their complete details
-        3. Make sure all numerical values are properly formatted as numbers, not strings
-        4. Only extract data that is actually present on the invoice
-        5. Do not make up or assume any values"""
-        
+        IMPORTANT RULES:
+        1. For missing text fields, use "NA"
+        2. For missing numeric fields, use 0
+        3. SKU/NDC must only come from a dedicated column, not from descriptions
+        4. Never make up or hallucinate data - only extract what's visible
+        5. For totals, only include values that are explicitly shown in the invoice
+        6. Do not calculate any values - only extract what's visible
+        7. If subtotal is not shown, leave it as 0
+        8. If discount is not shown, leave it as 0
+        9. If shipping is not shown, leave it as 0
+       10. If tax is not shown, leave it as 0
+       11. For items, include ALL products exactly as listed
+        """
         # Generate content
         response = MODEL.generate_content([prompt, {"mime_type": "image/jpeg", "data": img_data}])
         
@@ -146,26 +114,4 @@ def extract_fields_from_image(image_path: str) -> Tuple[Dict[str, str], str]:
     except Exception as e:
         return {}, f"Error processing image: {str(e)}"
 
-def extract_invoice_data(image_path: str) -> Optional[Dict]:
-    """Main function to extract invoice data - wrapper for extract_fields_from_image."""
-    try:
-        data, error = extract_fields_from_image(image_path)
-        if error:
-            print(f"Error extracting data: {error}")
-            return None
-        return data
-    except Exception as e:
-        print(f"Error in extract_invoice_data: {e}")
-        return None
-
-def save_to_csv(data: Dict[str, str], csv_file: str) -> bool:
-    """Save extracted data to CSV file."""
-    try:
-        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=data.keys())
-            writer.writeheader()
-            writer.writerow(data)
-        return True
-    except Exception as e:
-        print(f"Error saving to CSV: {e}")
-        return False
+# Removed save_to_csv function as it's not needed

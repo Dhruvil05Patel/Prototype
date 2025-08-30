@@ -1,44 +1,43 @@
-import os
-import json
-import uuid
-import csv
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template, redirect, url_for, flash, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
+import os
+import tempfile
+import csv
+import io
+import json
 import requests
-from invoice_extractor_server import extract_invoice_data
+import threading
+from datetime import datetime
+from invoice_extractor_server import extract_fields_from_image
 
-app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
-CORS(app)
-app.secret_key = os.getenv('SECRET_KEY', 'your-secret-key-here')
+app = Flask(__name__)
 
-# Configuration
+# Configure CORS to allow requests from Vercel frontend and local development
+CORS(app, origins=["*"])
+
+# Configure upload settings
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf'}
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+
+# Webhook configuration storage
 WEBHOOK_CONFIG_FILE = 'webhook_config.json'
-
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-# Ensure upload directory exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+WEBHOOK_LOGS = []
+RECEIVED_WEBHOOK_DATA = []  # Store actual received JSON data
 
 def load_webhook_config():
-    """Load webhook configuration from file"""
+    """Load webhook configuration from file."""
     try:
-        with open(WEBHOOK_CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-    except json.JSONDecodeError:
-        return {}
+        if os.path.exists(WEBHOOK_CONFIG_FILE):
+            with open(WEBHOOK_CONFIG_FILE, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading webhook config: {e}")
+    return {'webhooks': []}
 
 def save_webhook_config(config):
-    """Save webhook configuration to file"""
+    """Save webhook configuration to file."""
     try:
         with open(WEBHOOK_CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
@@ -47,403 +46,538 @@ def save_webhook_config(config):
         print(f"Error saving webhook config: {e}")
         return False
 
-def send_to_hubspot(invoice_data):
-    """Send invoice data to HubSpot CRM"""
-    HUBSPOT_API_KEY = os.getenv('HUBSPOT_API_KEY')
-    HUBSPOT_BASE_URL = "https://api.hubapi.com"
-    
-    # Configure which fields to send to HubSpot (set to False to exclude)
-    # Temporarily disabled custom fields for testing
-    HUBSPOT_FIELD_CONFIG = {
-        'invoice_number': False,     # GST Invoice Number - DISABLED FOR TESTING
-        'invoice_date': False,       # Invoice Date - DISABLED FOR TESTING
-        'vendor_gst': False,         # Company GST Number - DISABLED FOR TESTING
-        'invoice_items': False,      # Detailed items list (can be large)
-        'billing_address': False,    # Full billing address
-        'shipping_address': False,   # Full shipping address
-        'payment_terms': False,      # Payment terms and conditions
-        'tax_details': False,        # Detailed tax breakdown
-        'discount_details': False,   # Discount information
-        'notes': False,              # Additional notes
-        'currency': False,           # Currency code
-        'exchange_rate': False,      # Exchange rate if applicable
-        'due_date': False,           # Payment due date
-        'po_number': False,          # Purchase order number
-        'vendor_contact': False,     # Vendor contact information
-        'line_items_count': False,   # Number of line items
-        'attachment_url': False,     # URL to invoice attachment
-        'processing_status': False,  # Processing status
-        'approval_status': False,    # Approval status
-        'payment_status': False,     # Payment status
-        'created_by': False,         # User who created the record
-        'last_modified_by': False,   # User who last modified
-        'tags': False,               # Tags for categorization
-        'department': False,         # Department/cost center
-        'project_code': False,       # Project code if applicable
-        'vendor_category': False,    # Vendor category
-        'payment_method': False,     # Payment method
-        'bank_details': False,       # Bank details for payment
-        'recurring': False,          # Is this a recurring invoice
-        'parent_invoice': False,     # Parent invoice if this is a child
-        'workflow_stage': False,     # Current workflow stage
-        'escalation_level': False,   # Escalation level if any
-        'risk_score': False,         # Risk assessment score
-        'compliance_status': False,  # Compliance check status
-        'audit_trail': False,        # Audit trail information
-        'integration_source': False, # Source of integration
-        'custom_field_1': False,     # Custom field 1
-        'custom_field_2': False,     # Custom field 2
-        'custom_field_3': False,     # Custom field 3
-        'custom_field_4': False,     # Custom field 4
-        'custom_field_5': False,     # Custom field 5
-    }
-    
-    if not HUBSPOT_API_KEY:
-        print("Warning: HUBSPOT_API_KEY not found in environment variables")
-        return False
-    
-    # Prepare the data for HubSpot
-    hubspot_data = {
-        "properties": {}
-    }
-    
-    # Add basic fields that are always included
-    basic_fields = {
-        'company_name': invoice_data.get('vendor_name', ''),
-        'total_amount': str(invoice_data.get('total_amount', 0)),
-        'invoice_status': 'processed'
-    }
-    
-    # Add basic fields to properties
-    for field, value in basic_fields.items():
-        if value:  # Only add non-empty values
-            hubspot_data["properties"][field] = value
-    
-    # Add configured fields
-    field_mapping = {
-        'invoice_number': invoice_data.get('invoice_number', ''),
-        'invoice_date': invoice_data.get('invoice_date', ''),
-        'vendor_gst': invoice_data.get('vendor_gst', ''),
-        'invoice_items': json.dumps(invoice_data.get('items', [])),
-        'billing_address': invoice_data.get('billing_address', ''),
-        'shipping_address': invoice_data.get('shipping_address', ''),
-        'payment_terms': invoice_data.get('payment_terms', ''),
-        'tax_details': json.dumps(invoice_data.get('tax_details', {})),
-        'discount_details': json.dumps(invoice_data.get('discount_details', {})),
-        'notes': invoice_data.get('notes', ''),
-        'currency': invoice_data.get('currency', 'INR'),
-        'exchange_rate': str(invoice_data.get('exchange_rate', 1.0)),
-        'due_date': invoice_data.get('due_date', ''),
-        'po_number': invoice_data.get('po_number', ''),
-        'vendor_contact': invoice_data.get('vendor_contact', ''),
-        'line_items_count': str(len(invoice_data.get('items', []))),
-        'attachment_url': invoice_data.get('attachment_url', ''),
-        'processing_status': 'completed',
-        'approval_status': 'pending',
-        'payment_status': 'pending',
-        'created_by': 'invoice_scanner',
-        'last_modified_by': 'invoice_scanner',
-        'tags': 'automated_processing',
-        'department': invoice_data.get('department', ''),
-        'project_code': invoice_data.get('project_code', ''),
-        'vendor_category': invoice_data.get('vendor_category', ''),
-        'payment_method': invoice_data.get('payment_method', ''),
-        'bank_details': invoice_data.get('bank_details', ''),
-        'recurring': str(invoice_data.get('recurring', False)),
-        'parent_invoice': invoice_data.get('parent_invoice', ''),
-        'workflow_stage': 'data_extracted',
-        'escalation_level': '0',
-        'risk_score': str(invoice_data.get('risk_score', 0)),
-        'compliance_status': 'pending_review',
-        'audit_trail': json.dumps([{
-            'action': 'data_extracted',
+def send_webhook(url, data, headers=None):
+    """Send data to webhook URL asynchronously."""
+    def _send():
+        log_entry = {
             'timestamp': datetime.now().isoformat(),
-            'user': 'system'
-        }]),
-        'integration_source': 'invoice_scanner_api',
-        'custom_field_1': invoice_data.get('custom_field_1', ''),
-        'custom_field_2': invoice_data.get('custom_field_2', ''),
-        'custom_field_3': invoice_data.get('custom_field_3', ''),
-        'custom_field_4': invoice_data.get('custom_field_4', ''),
-        'custom_field_5': invoice_data.get('custom_field_5', ''),
-    }
-    
-    # Add only enabled fields to the request
-    for field, value in field_mapping.items():
-        if HUBSPOT_FIELD_CONFIG.get(field, False) and value:
-            hubspot_data["properties"][field] = value
-    
-    # Send to HubSpot Companies API
-    headers = {
-        'Authorization': f'Bearer {HUBSPOT_API_KEY}',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        response = requests.post(
-            f'{HUBSPOT_BASE_URL}/crm/v3/objects/companies',
-            headers=headers,
-            json=hubspot_data,
-            timeout=30
-        )
+            'url': url,
+            'status': 'pending',
+            'response_code': None,
+            'error': None
+        }
         
-        if response.status_code == 201:
-            print("Successfully sent invoice data to HubSpot")
-            return True
-        else:
-            print(f"Failed to send to HubSpot: {response.status_code} - {response.text}")
-            return False
+        try:
+            webhook_headers = {'Content-Type': 'application/json'}
+            if headers:
+                webhook_headers.update(headers)
             
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending to HubSpot: {e}")
-        return False
-
-def send_webhook(invoice_data, webhook_url):
-    """Send invoice data to configured webhook URL"""
-    try:
-        response = requests.post(
-            webhook_url,
-            json=invoice_data,
-            headers={'Content-Type': 'application/json'},
-            timeout=30
-        )
+            response = requests.post(
+                url, 
+                json=data, 
+                headers=webhook_headers,
+                timeout=30
+            )
+            
+            log_entry['status'] = 'success' if response.status_code < 400 else 'failed'
+            log_entry['response_code'] = response.status_code
+            log_entry['response_text'] = response.text[:500]  # Limit response text
+            
+        except Exception as e:
+            log_entry['status'] = 'error'
+            log_entry['error'] = str(e)
         
-        if response.status_code == 200:
-            print(f"Successfully sent webhook to {webhook_url}")
-            return True
-        else:
-            print(f"Webhook failed: {response.status_code} - {response.text}")
-            return False
-            
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending webhook: {e}")
-        return False
+        # Store log (keep only last 100 entries)
+        WEBHOOK_LOGS.append(log_entry)
+        if len(WEBHOOK_LOGS) > 100:
+            WEBHOOK_LOGS.pop(0)
+    
+    # Send webhook in background thread
+    thread = threading.Thread(target=_send)
+    thread.daemon = True
+    thread.start()
 
-@app.route('/')
-def index():
-    return send_from_directory(app.static_folder, 'index.html')
+def flatten_invoice_data(data):
+    """Flatten nested invoice data for CSV export."""
+    flattened = {}
+    
+    def flatten_dict(d, prefix=''):
+        for key, value in d.items():
+            if isinstance(value, dict):
+                flatten_dict(value, f"{prefix}{key}_")
+            elif isinstance(value, list):
+                if key == 'items':
+                    # Handle items array specially
+                    for i, item in enumerate(value):
+                        for item_key, item_value in item.items():
+                            flattened[f"item_{i+1}_{item_key}"] = item_value
+                else:
+                    flattened[f"{prefix}{key}"] = str(value)
+            else:
+                flattened[f"{prefix}{key}"] = value
+    
+    flatten_dict(data)
+    return flattened
 
-@app.route('/<path:path>')
-def serve_static(path):
-    return send_from_directory(app.static_folder, path)
-
-@app.route('/upload', methods=['GET', 'POST'])
-def upload_file():
-    if request.method == 'POST':
-        # Check if the post request has the file part
+@app.route('/api/extract', methods=['POST'])
+def extract_invoice_data():
+    """Extract data from uploaded invoice image."""
+    try:
+        # Check if file is present
         if 'file' not in request.files:
-            flash('No file part')
-            return redirect(request.url)
+            return jsonify({'error': 'No file uploaded'}), 400
         
         file = request.files['file']
-        
-        # If user does not select file, browser also submits an empty part without filename
         if file.filename == '':
-            flash('No selected file')
-            return redirect(request.url)
+            return jsonify({'error': 'No file selected'}), 400
         
-        if file and allowed_file(file.filename):
-            # Generate a unique filename to avoid conflicts
-            file_extension = file.filename.rsplit('.', 1)[1].lower()
-            unique_filename = f"temp_invoice_{uuid.uuid4().hex[:16]}.{file_extension}"
-            filename = secure_filename(unique_filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
+        # Validate file type
+        allowed_extensions = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff'}
+        file_extension = file.filename.rsplit('.', 1)[1].lower() if '.' in file.filename else ''
+        
+        if file_extension not in allowed_extensions:
+            return jsonify({'error': 'Invalid file type. Please upload an image file.'}), 400
+        
+        # Save uploaded file temporarily
+        temp_filename = f"temp_invoice_{os.urandom(8).hex()}.{file_extension}"
+        temp_path = os.path.join(UPLOAD_FOLDER, temp_filename)
+        file.save(temp_path)
+        
+        try:
+            # Extract data using your existing function
+            extracted_data, error_message = extract_fields_from_image(temp_path)
             
-            try:
-                # Extract invoice data
-                invoice_data = extract_invoice_data(filepath)
-                
-                if invoice_data:
-                    # Save to CSV
-                    csv_filename = os.path.join(app.config['UPLOAD_FOLDER'], 'extracted_invoices.csv')
-                    
-                    # Check if CSV exists to determine if we need headers
-                    file_exists = os.path.exists(csv_filename)
-                    
-                    with open(csv_filename, 'a', newline='', encoding='utf-8') as csvfile:
-                        fieldnames = [
-                            'timestamp', 'filename', 'vendor_name', 'vendor_gst', 'invoice_number', 
-                            'invoice_date', 'total_amount', 'tax_amount', 'subtotal', 'items_count',
-                            'billing_address', 'shipping_address', 'payment_terms'
-                        ]
-                        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                        
-                        # Write header if file is new
-                        if not file_exists:
-                            writer.writeheader()
-                        
-                        # Prepare row data
-                        row_data = {
-                            'timestamp': datetime.now().isoformat(),
-                            'filename': filename,
-                            'vendor_name': invoice_data.get('vendor_name', ''),
-                            'vendor_gst': invoice_data.get('vendor_gst', ''),
-                            'invoice_number': invoice_data.get('invoice_number', ''),
-                            'invoice_date': invoice_data.get('invoice_date', ''),
-                            'total_amount': invoice_data.get('total_amount', 0),
-                            'tax_amount': invoice_data.get('tax_amount', 0),
-                            'subtotal': invoice_data.get('subtotal', 0),
-                            'items_count': len(invoice_data.get('items', [])),
-                            'billing_address': invoice_data.get('billing_address', ''),
-                            'shipping_address': invoice_data.get('shipping_address', ''),
-                            'payment_terms': invoice_data.get('payment_terms', '')
-                        }
-                        
-                        writer.writerow(row_data)
-                    
-                    # Load webhook configuration
-                    webhook_config = load_webhook_config()
-                    
-                    # Send to HubSpot if enabled
-                    if webhook_config.get('hubspot_enabled', False):
-                        send_to_hubspot(invoice_data)
-                    
-                    # Send to custom webhook if configured
-                    if webhook_config.get('webhook_enabled', False) and webhook_config.get('webhook_url'):
-                        send_webhook(invoice_data, webhook_config['webhook_url'])
-                    
-                    flash('Invoice processed successfully!')
-                    return jsonify({
-                        'success': True,
-                        'message': 'Invoice processed successfully',
-                        'data': invoice_data
-                    })
-                else:
-                    flash('Failed to extract invoice data')
-                    return jsonify({
-                        'success': False,
-                        'message': 'Failed to extract invoice data'
-                    }), 400
-                    
-            except Exception as e:
-                flash(f'Error processing invoice: {str(e)}')
-                return jsonify({
-                    'success': False,
-                    'message': f'Error processing invoice: {str(e)}'
-                }), 500
-            finally:
-                # Clean up the uploaded file
-                if os.path.exists(filepath):
-                    os.remove(filepath)
-    
-    return render_template('upload.html')
+            if error_message:
+                return jsonify({'error': error_message}), 500
+            
+            if not extracted_data:
+                return jsonify({'error': 'No data could be extracted from the invoice'}), 400
+            
+            # Clean up temporary file
+            os.remove(temp_path)
+            
+            # Store current invoice data (replace any previous data)
+            current_entry = {
+                'timestamp': datetime.now().isoformat(),
+                'data': extracted_data
+            }
+            RECEIVED_WEBHOOK_DATA[:] = [current_entry]
+            
+            # Send data to configured webhooks
+            config = load_webhook_config()
+            for webhook in config.get('webhooks', []):
+                if webhook.get('enabled', True):
+                    send_webhook(
+                        webhook['url'], 
+                        extracted_data, 
+                        webhook.get('headers', {})
+                    )
+            
+            return jsonify(extracted_data)
+            
+        except Exception as e:
+            # Clean up temporary file in case of error
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise e
+            
+    except Exception as e:
+        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
 
-@app.route('/api/download-json', methods=['POST'])
-def api_download_json():
-    """API endpoint for downloading JSON data"""
+@app.route('/api/download-csv', methods=['POST'])
+def download_csv():
+    """Generate and download CSV file from extracted data."""
     try:
         data = request.get_json()
+        
         if not data:
             return jsonify({'error': 'No data provided'}), 400
         
-        # Create a temporary file
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(data, f, indent=2)
-            temp_path = f.name
+        # Create CSV content in memory
+        output = io.StringIO()
         
-        return send_file(temp_path, as_attachment=True, download_name='extracted_invoice_data.json')
+        # Flatten the structured data for CSV
+        flattened_data = flatten_invoice_data(data)
+        
+        # Write CSV headers and data
+        fieldnames = list(flattened_data.keys())
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(flattened_data)
+        
+        # Convert to bytes
+        csv_content = output.getvalue()
+        output.close()
+        
+        # Create a temporary file for download
+        temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.csv')
+        temp_file.write(csv_content)
+        temp_file.close()
+        
+        return send_file(
+            temp_file.name,
+            as_attachment=True,
+            download_name='extracted_invoice_data.csv',
+            mimetype='text/csv'
+        )
+        
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f'CSV generation failed: {str(e)}'}), 500
 
-@app.route('/api/extract', methods=['POST'])
-def api_extract():
-    """API endpoint for invoice extraction"""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'File type not allowed'}), 400
-    
-    # Generate a unique filename
-    file_extension = file.filename.rsplit('.', 1)[1].lower()
-    unique_filename = f"temp_invoice_{uuid.uuid4().hex[:16]}.{file_extension}"
-    filename = secure_filename(unique_filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    
+@app.route('/api/download-json', methods=['POST'])
+def download_json():
+    """Generate and download JSON file from extracted data."""
     try:
-        file.save(filepath)
+        data = request.get_json()
         
-        # Extract invoice data
-        invoice_data = extract_invoice_data(filepath)
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
         
-        if invoice_data:
-            # Load webhook configuration
-            webhook_config = load_webhook_config()
-            
-            # Send to HubSpot if enabled
-            if webhook_config.get('hubspot_enabled', False):
-                send_to_hubspot(invoice_data)
-            
-            # Send to custom webhook if configured
-            if webhook_config.get('webhook_enabled', False) and webhook_config.get('webhook_url'):
-                send_webhook(invoice_data, webhook_config['webhook_url'])
-            
-            return jsonify({
-                'success': True,
-                'data': invoice_data
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Failed to extract invoice data'
-            }), 400
-            
+        # Create a temporary file for download
+        temp_file = tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.json')
+        json.dump(data, temp_file, indent=2, ensure_ascii=False)
+        temp_file.close()
+        
+        return send_file(
+            temp_file.name,
+            as_attachment=True,
+            download_name='extracted_invoice_data.json',
+            mimetype='application/json'
+        )
+        
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-    finally:
-        # Clean up the uploaded file
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        return jsonify({'error': f'JSON generation failed: {str(e)}'}), 500
 
-@app.route('/webhook-config', methods=['GET', 'POST'])
-def webhook_config():
-    """Configure webhook settings"""
-    if request.method == 'POST':
-        config = {
-            'webhook_enabled': request.form.get('webhook_enabled') == 'on',
-            'webhook_url': request.form.get('webhook_url', ''),
-            'hubspot_enabled': request.form.get('hubspot_enabled') == 'on'
+@app.route('/api/webhooks', methods=['GET'])
+def get_webhooks():
+    """Get all configured webhooks."""
+    config = load_webhook_config()
+    return jsonify(config)
+
+@app.route('/api/webhooks', methods=['POST'])
+def add_webhook():
+    """Add a new webhook configuration."""
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('url'):
+            return jsonify({'error': 'Webhook URL is required'}), 400
+        
+        config = load_webhook_config()
+        
+        webhook = {
+            'id': len(config['webhooks']) + 1,
+            'name': data.get('name', f"Webhook {len(config['webhooks']) + 1}"),
+            'url': data['url'],
+            'enabled': data.get('enabled', True),
+            'headers': data.get('headers', {}),
+            'created_at': datetime.now().isoformat()
         }
         
-        if save_webhook_config(config):
-            flash('Webhook configuration saved successfully!')
-        else:
-            flash('Error saving webhook configuration')
+        config['webhooks'].append(webhook)
         
-        return redirect(url_for('webhook_config'))
-    
-    # Load current configuration
-    config = load_webhook_config()
-    return render_template('webhook_config.html', config=config)
+        if save_webhook_config(config):
+            return jsonify(webhook), 201
+        else:
+            return jsonify({'error': 'Failed to save webhook configuration'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'Failed to add webhook: {str(e)}'}), 500
 
-@app.route('/download-csv')
-def download_csv():
-    """Download the extracted invoices CSV file"""
-    csv_filename = os.path.join(app.config['UPLOAD_FOLDER'], 'extracted_invoices.csv')
-    
-    if os.path.exists(csv_filename):
-        return send_file(csv_filename, as_attachment=True, download_name='extracted_invoices.csv')
-    else:
-        flash('No CSV file found')
-        return redirect(url_for('index'))
+@app.route('/api/webhooks/<int:webhook_id>', methods=['DELETE'])
+def delete_webhook(webhook_id):
+    """Delete a webhook configuration."""
+    try:
+        config = load_webhook_config()
+        config['webhooks'] = [w for w in config['webhooks'] if w.get('id') != webhook_id]
+        
+        if save_webhook_config(config):
+            return jsonify({'message': 'Webhook deleted successfully'})
+        else:
+            return jsonify({'error': 'Failed to save webhook configuration'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'Failed to delete webhook: {str(e)}'}), 500
 
-@app.route('/health')
-def health_check():
-    """Health check endpoint"""
+@app.route('/api/webhooks/<int:webhook_id>/toggle', methods=['POST'])
+def toggle_webhook(webhook_id):
+    """Toggle webhook enabled/disabled status."""
+    try:
+        config = load_webhook_config()
+        
+        for webhook in config['webhooks']:
+            if webhook.get('id') == webhook_id:
+                webhook['enabled'] = not webhook.get('enabled', True)
+                break
+        
+        if save_webhook_config(config):
+            return jsonify({'message': 'Webhook status updated'})
+        else:
+            return jsonify({'error': 'Failed to save webhook configuration'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': f'Failed to toggle webhook: {str(e)}'}), 500
+
+@app.route('/api/webhook-logs', methods=['GET'])
+def get_webhook_logs():
+    """Get webhook delivery logs."""
+    return jsonify({'logs': WEBHOOK_LOGS})
+
+@app.route('/api/demo-webhook', methods=['POST'])
+def demo_webhook():
+    """Demo webhook endpoint to receive invoice data."""
+    try:
+        data = request.get_json()
+        
+        # Log the received data
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'type': 'demo_webhook_received',
+            'data_keys': list(data.keys()) if data else [],
+            'invoice_number': data.get('invoice_info', {}).get('gst_invoice_number', 'N/A') if data else 'N/A',
+            'company_name': data.get('company_info', {}).get('company_name', 'N/A') if data else 'N/A',
+            'total_amount': data.get('totals', {}).get('total_invoice', 'N/A') if data else 'N/A'
+        }
+        
+        # Store in webhook logs for demonstration
+        WEBHOOK_LOGS.append(log_entry)
+        if len(WEBHOOK_LOGS) > 100:
+            WEBHOOK_LOGS.pop(0)
+        
+        # Only store data if this is a demo webhook call (not from main extraction)
+        # Check if data is already stored from main extraction process
+        if not RECEIVED_WEBHOOK_DATA or RECEIVED_WEBHOOK_DATA[0]['data'] != data:
+            received_entry = {
+                'timestamp': log_entry['timestamp'],
+                'data': data
+            }
+            # Replace entire list with single current entry
+            RECEIVED_WEBHOOK_DATA[:] = [received_entry]
+        
+        print(f"Demo webhook received data: {log_entry}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Invoice data received successfully',
+            'received_at': log_entry['timestamp'],
+            'data_summary': {
+                'invoice_number': log_entry['invoice_number'],
+                'company_name': log_entry['company_name'],
+                'total_amount': log_entry['total_amount'],
+                'fields_count': len(log_entry['data_keys'])
+            }
+        }), 200
+        
+    except Exception as e:
+        error_log = {
+            'timestamp': datetime.now().isoformat(),
+            'type': 'demo_webhook_error',
+            'error': str(e)
+        }
+        WEBHOOK_LOGS.append(error_log)
+        
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to process webhook data: {str(e)}'
+        }), 500
+
+@app.route('/api/get-data', methods=['GET'])
+def get_demo_webhook_data():
+    """Get all JSON data received by the demo webhook."""
     return jsonify({
-        'status': 'healthy',
+        'data': RECEIVED_WEBHOOK_DATA
+    })
+
+@app.route('/api/clear-webhook-data', methods=['POST'])
+def clear_webhook_data():
+    """Clear all stored webhook data."""
+    RECEIVED_WEBHOOK_DATA.clear()
+    WEBHOOK_LOGS.clear()
+    return jsonify({
+        'status': 'success',
+        'message': 'All webhook data cleared',
         'timestamp': datetime.now().isoformat()
     })
 
+@app.route('/api/test-webhook-system', methods=['GET'])
+def test_webhook_system():
+    """Test all webhook-related endpoints - combines test_webhook.py functionality."""
+    results = {
+        'timestamp': datetime.now().isoformat(),
+        'tests': []
+    }
+    
+    try:
+        # 1. Check server health
+        results['tests'].append({
+            'name': 'Server Health Check',
+            'status': 'success',
+            'message': 'Server is running'
+        })
+        
+        # 2. Check/Add demo webhook configuration (prevent duplicates)
+        webhook_url = request.url_root.rstrip('/') + '/api/demo-webhook'
+        config = load_webhook_config()
+        
+        # Check if demo webhook already exists
+        existing_webhook = None
+        for webhook in config['webhooks']:
+            if webhook['url'] == webhook_url and 'Auto Test' in webhook['name']:
+                existing_webhook = webhook
+                break
+        
+        if existing_webhook:
+            results['tests'].append({
+                'name': 'Check Webhook Configuration',
+                'status': 'success',
+                'message': f'Demo webhook already exists: {existing_webhook["name"]} (ID: {existing_webhook["id"]})',
+                'webhook_id': existing_webhook['id']
+            })
+        else:
+            # Add new webhook only if it doesn't exist
+            webhook_data = {
+                "name": "Auto Test Webhook",
+                "url": webhook_url,
+                "enabled": True,
+                "headers": {
+                    "Authorization": "Bearer test-token",
+                    "X-Source": "auto-test"
+                }
+            }
+            
+            webhook = {
+                'id': len(config['webhooks']) + 1,
+                'name': webhook_data['name'],
+                'url': webhook_data['url'],
+                'enabled': webhook_data.get('enabled', True),
+                'headers': webhook_data.get('headers', {}),
+                'created_at': datetime.now().isoformat()
+            }
+            config['webhooks'].append(webhook)
+            
+            if save_webhook_config(config):
+                results['tests'].append({
+                    'name': 'Add Webhook Configuration',
+                    'status': 'success',
+                    'message': f'New webhook added: {webhook["name"]} (ID: {webhook["id"]})',
+                    'webhook_id': webhook['id']
+                })
+            else:
+                results['tests'].append({
+                    'name': 'Add Webhook Configuration',
+                    'status': 'failed',
+                    'message': 'Failed to save webhook configuration'
+                })
+        
+        # 3. Get all webhooks
+        config = load_webhook_config()
+        results['tests'].append({
+            'name': 'Get Webhooks',
+            'status': 'success',
+            'message': f'Found {len(config["webhooks"])} webhook(s)',
+            'webhooks': [{'name': w['name'], 'url': w['url'], 'enabled': w.get('enabled', True)} for w in config['webhooks']]
+        })
+        
+        # 4. Test demo webhook directly
+        sample_invoice_data = {
+            "company_info": {
+                "company_name": "Test Company Ltd",
+                "gstin": "27ABCDE1234F1Z5"
+            },
+            "invoice_info": {
+                "gst_invoice_number": "AUTO-TEST-001",
+                "invoice_date": "2024-08-28"
+            },
+            "totals": {
+                "total_invoice": 15000.00
+            },
+            "items": [
+                {
+                    "description_of_goods": "Test Product",
+                    "quantity": 2,
+                    "rate": 7500.00,
+                    "amount": 15000.00
+                }
+            ]
+        }
+        
+        # Simulate webhook call by calling the demo webhook function directly
+        try:
+            # Store current request context
+            with app.test_request_context(json=sample_invoice_data, content_type='application/json'):
+                demo_response = demo_webhook()
+                if demo_response[1] == 200:  # Check status code
+                    response_data = demo_response[0].get_json()
+                    results['tests'].append({
+                        'name': 'Demo Webhook Test',
+                        'status': 'success',
+                        'message': 'Demo webhook received data successfully',
+                        'data_summary': response_data.get('data_summary', {})
+                    })
+                else:
+                    results['tests'].append({
+                        'name': 'Demo Webhook Test',
+                        'status': 'failed',
+                        'message': 'Demo webhook test failed'
+                    })
+        except Exception as e:
+            results['tests'].append({
+                'name': 'Demo Webhook Test',
+                'status': 'error',
+                'message': f'Demo webhook test error: {str(e)}'
+            })
+        
+        # 5. Check webhook logs
+        results['tests'].append({
+            'name': 'Webhook Logs Check',
+            'status': 'success',
+            'message': f'Found {len(WEBHOOK_LOGS)} log entries',
+            'recent_logs': WEBHOOK_LOGS[-3:] if len(WEBHOOK_LOGS) > 0 else []
+        })
+        
+        # # Summary
+        # success_count = sum(1 for test in results['tests'] if test['status'] == 'success')
+        # total_count = len(results['tests'])
+        
+        # results['summary'] = {
+        #     'total_tests': total_count,
+        #     'successful': success_count,
+        #     'failed': total_count - success_count,
+        #     'overall_status': 'success' if success_count == total_count else 'partial_success'
+        # }
+        
+        results['usage_info'] = {
+            'demo_webhook_url': request.url_root.rstrip('/') + '/api/demo-webhook',
+            'webhook_management': request.url_root.rstrip('/') + '/api/webhooks',
+            'webhook_logs': request.url_root.rstrip('/') + '/api/webhook-logs',
+            'received_data': request.url_root.rstrip('/') + '/api/demo-webhook-data'
+        }
+        
+        return jsonify(results)
+        
+    except Exception as e:
+        results['tests'].append({
+            'name': 'System Test',
+            'status': 'error',
+            'message': f'Test system error: {str(e)}'
+        })
+        results['summary'] = {
+            'total_tests': len(results['tests']),
+            'successful': 0,
+            'failed': len(results['tests']),
+            'overall_status': 'failed'
+        }
+        return jsonify(results), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({'status': 'healthy', 'message': 'Invoice extractor API is running'})
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'File too large. Maximum size is 16MB.'}), 413
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    print("Starting Invoice Extractor API...")
+    print("Make sure your .env file contains the GOOGLE_API_KEY")
+    port = int(os.environ.get('PORT', 5001))
+    app.run(debug=False, host='0.0.0.0', port=port)
